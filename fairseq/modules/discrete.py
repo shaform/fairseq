@@ -4,13 +4,12 @@ import torch.nn.functional as F
 
 
 class VectorQuantizer(nn.Module):
-    def __init__(self, n_token, n_embed, decay=0.99, eps=1e-8):
+    def __init__(self, n_token, n_embed, decay=0.99):
         super().__init__()
 
         self.n_token = n_token
         self.n_embed = n_embed
         self._decay = decay
-        self._eps = eps
 
         self._embeds = nn.Embedding(self.n_token, self.n_embed)
         self._embeds.weight.requires_grad = False
@@ -24,13 +23,11 @@ class VectorQuantizer(nn.Module):
 
     def get_distances(self, inputs):
         embeds = self.get_weights()
-        dists = ((inputs**2).sum(dim=-1, keepdim=True) +
-                 (embeds**2).sum(dim=-1)[None, :] -
-                 2 * torch.matmul(inputs, embeds.t()))
+        dists = ((inputs**2).sum(dim=-1, keepdim=True) + (embeds**2).sum(
+            dim=-1)[None, :] - 2 * torch.matmul(inputs, embeds.t()))
         return dists
 
-    def forward(self, inputs):
-
+    def forward(self, inputs, rho=None, return_mse=False):
         size = inputs.size()
         inputs = inputs.view(-1, self.n_embed)
 
@@ -44,9 +41,23 @@ class VectorQuantizer(nn.Module):
         if self.training:
             self._update_ema(inputs, indices, rev_indices)
 
+        # gating function
+        if rho is not None and rho < 1.0 and self.training:
+            gate_probs = rho * torch.ones(
+                inputs.size()[0], dtype=inputs.dtype, device=inputs.device)
+            gates = torch.bernoulli(gate_probs)[:, None].to(inputs.dtype)
+            quantized = quantized * gates + (1. - gates) * inputs
+
         # return original shape
         quantized = quantized.reshape(size)
 
+        if return_mse:
+            mse = (((inputs - quantized_embs.detach())**2).sum(dim=-1) /
+                   self.n_embed)
+            mse = mse.reshape(size[:-1])
+            # L x B -> B
+            mse = mse.mean(dim=0)
+            return quantized, mse
         return quantized
 
     def _update_weights(self):
@@ -58,24 +69,25 @@ class VectorQuantizer(nn.Module):
         # rev_indices: [N]
         assert len(indices.size()) == 1
         assert len(rev_indices.size()) == 1
-        bsz = indices.size()[0]
 
+        bsz = indices.size()[0]
         n_sample = indices.size()[-1]
         ratio = 1.0 * self.n_token / n_sample
 
         # update counts
         one_hots = F.one_hot(indices, self.n_token).to(inputs.dtype) * ratio
-        rev_one_hots = F.one_hot(rev_indices, bsz).to(inputs.dtype) / self.n_token
+        rev_one_hots = F.one_hot(rev_indices, bsz).to(
+            inputs.dtype) / self.n_token
 
         batch_cnts = (one_hots + rev_one_hots.t())
         cnts = batch_cnts.sum(dim=0)
-        self._ema_n.data = (self._ema_n.data * self._decay +
-                            (1 - self._decay) * cnts)
+        self._ema_n.data = (
+            self._ema_n.data * self._decay + (1 - self._decay) * cnts)
 
         # update weights
         ws = batch_cnts.t().matmul(inputs)
-        self._ema_w.data = (self._ema_w.data * self._decay +
-                            (1 - self._decay) * ws.data)
+        self._ema_w.data = (
+            self._ema_w.data * self._decay + (1 - self._decay) * ws.data)
 
         self._update_weights()
 
@@ -101,9 +113,8 @@ class VectorQuantizedDropout(nn.Module):
 
     def get_distances(self, inputs):
         embeds = self.get_weights()
-        dists = ((inputs**2).sum(dim=-1, keepdim=True) +
-                 (embeds**2).sum(dim=-1)[None, :] -
-                 2 * torch.matmul(inputs, embeds.t()))
+        dists = ((inputs**2).sum(dim=-1, keepdim=True) + (embeds**2).sum(
+            dim=-1)[None, :] - 2 * torch.matmul(inputs, embeds.t()))
         return dists
 
     def forward(self, inputs, rho=1.):
@@ -151,17 +162,18 @@ class VectorQuantizedDropout(nn.Module):
 
         # update counts
         one_hots = F.one_hot(indices, self.n_token).to(inputs.dtype) * ratio
-        rev_one_hots = F.one_hot(rev_indices, bsz).to(inputs.dtype) / self.n_token
+        rev_one_hots = F.one_hot(rev_indices, bsz).to(
+            inputs.dtype) / self.n_token
 
         batch_cnts = (one_hots + rev_one_hots.t())
         cnts = batch_cnts.sum(dim=0)
-        self._ema_n.data = (self._ema_n.data * self._decay +
-                            (1 - self._decay) * cnts)
+        self._ema_n.data = (
+            self._ema_n.data * self._decay + (1 - self._decay) * cnts)
 
         # update weights
         ws = batch_cnts.t().matmul(inputs)
-        self._ema_w.data = (self._ema_w.data * self._decay +
-                            (1 - self._decay) * ws.data)
+        self._ema_w.data = (
+            self._ema_w.data * self._decay + (1 - self._decay) * ws.data)
 
         self._update_weights()
 
@@ -219,9 +231,8 @@ class VectorQuantizedMemory(nn.Module):
 
     def get_distances(self, inputs):
         embeds = self.get_key_weights()
-        dists = ((inputs**2).sum(dim=-1, keepdim=True) +
-                 (embeds**2).sum(dim=-1)[None, :] -
-                 2 * torch.matmul(inputs, embeds.t()))
+        dists = ((inputs**2).sum(dim=-1, keepdim=True) + (embeds**2).sum(
+            dim=-1)[None, :] - 2 * torch.matmul(inputs, embeds.t()))
         return dists
 
     def forward(self, inputs):
@@ -255,13 +266,13 @@ class VectorQuantizedMemory(nn.Module):
         # update counts
         batch_cnts = F.one_hot(indices, self.n_token).to(inputs.dtype) * ratio
         cnts = batch_cnts.sum(dim=0)
-        self._ema_n.data = (self._ema_n.data * self._decay +
-                            (1 - self._decay) * cnts)
+        self._ema_n.data = (
+            self._ema_n.data * self._decay + (1 - self._decay) * cnts)
 
         # update weights
         ws = batch_cnts.t().matmul(inputs)
-        self._ema_w.data = (self._ema_w.data * self._decay +
-                            (1 - self._decay) * ws.data)
+        self._ema_w.data = (
+            self._ema_w.data * self._decay + (1 - self._decay) * ws.data)
 
         self._update_weights()
 
@@ -304,9 +315,8 @@ class VectorQuantizerMaxEnt(nn.Module):
 
         # get quantized outputs
         probs = self.get_probs(inputs, tau=tau)
-        samples = torch.multinomial(probs,
-                                    num_samples=self._n_sample,
-                                    replacement=True)
+        samples = torch.multinomial(
+            probs, num_samples=self._n_sample, replacement=True)
         quantized_embs = self._embeds(samples).mean(dim=1)
         quantized = inputs + (quantized_embs - inputs).detach()
 
@@ -346,12 +356,12 @@ class VectorQuantizerMaxEnt(nn.Module):
         one_hots = F.one_hot(samples, self.n_token).to(inputs.dtype)
         batch_cnts = one_hots.sum(dim=1) * ratio
         cnts = batch_cnts.sum(dim=0)
-        self._ema_n.data = (self._ema_n.data * self._decay +
-                            (1 - self._decay) * cnts)
+        self._ema_n.data = (
+            self._ema_n.data * self._decay + (1 - self._decay) * cnts)
 
         # update weights
         ws = batch_cnts.t().matmul(inputs)
-        self._ema_w.data = (self._ema_w.data * self._decay +
-                            (1 - self._decay) * ws.data)
+        self._ema_w.data = (
+            self._ema_w.data * self._decay + (1 - self._decay) * ws.data)
 
         self._update_weights()

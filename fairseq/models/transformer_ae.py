@@ -6,6 +6,7 @@
 import math
 from typing import Any, Dict, List, NamedTuple, Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -23,7 +24,6 @@ from fairseq.models.transformer import (
     Linear,
     TransformerEncoder,
     TransformerDecoder,
-    EncoderOut
 )
 from fairseq.modules import (
     AdaptiveSoftmax,
@@ -92,14 +92,10 @@ class TransformerAutoEncodeModel(BaseFairseqModel):
                             help='dropout probability for attention weights')
         parser.add_argument('--activation-dropout', '--relu-dropout', type=float, metavar='D',
                             help='dropout probability after activation in FFN.')
-        parser.add_argument('--source-embed-path', type=str, metavar='STR',
-                            help='path to pre-trained source embedding')
-        parser.add_argument('--source-embed-dim', type=int, metavar='N',
+        parser.add_argument('--encoder-embed-path', type=str, metavar='STR',
+                            help='path to pre-trained encoder embedding')
+        parser.add_argument('--encoder-embed-dim', type=int, metavar='N',
                             help='encoder embedding dimension')
-        parser.add_argument('--target-embed-path', type=str, metavar='STR',
-                            help='path to pre-trained decoder embedding')
-        parser.add_argument('--target-embed-dim', type=int, metavar='N',
-                            help='decoder embedding dimension')
         parser.add_argument('--encoder-ffn-embed-dim', type=int, metavar='N',
                             help='encoder embedding dimension for FFN')
         parser.add_argument('--encoder-layers', type=int, metavar='N',
@@ -110,6 +106,10 @@ class TransformerAutoEncodeModel(BaseFairseqModel):
                             help='apply layernorm before each encoder block')
         parser.add_argument('--encoder-learned-pos', action='store_true',
                             help='use learned positional embeddings in the encoder')
+        parser.add_argument('--decoder-embed-path', type=str, metavar='STR',
+                            help='path to pre-trained decoder embedding')
+        parser.add_argument('--decoder-embed-dim', type=int, metavar='N',
+                            help='decoder embedding dimension')
         parser.add_argument('--decoder-ffn-embed-dim', type=int, metavar='N',
                             help='decoder embedding dimension for FFN')
         parser.add_argument('--decoder-layers', type=int, metavar='N',
@@ -197,25 +197,25 @@ class TransformerAutoEncodeModel(BaseFairseqModel):
                 utils.load_embedding(embed_dict, dictionary, emb)
             return emb, latent_idx
 
-        if args.source_embed_dim != args.target_embed_dim:
+        if args.encoder_embed_dim != args.decoder_embed_dim:
             raise ValueError(
                 "requires --source-embed-dim to match --target-embed-dim"
             )
         if args.share_all_embeddings:
             if src_dict != tgt_dict:
                 raise ValueError("--share-all-embeddings requires a joined dictionary")
-            if args.source_embed_dim != args.target_embed_dim:
+            if args.encoder_embed_dim != args.decoder_embed_dim:
                 raise ValueError(
-                    "--share-all-embeddings requires --source-embed-dim to match --target-embed-dim"
+                    "--share-all-embeddings requires --encoder-embed-dim to match --decoder-embed-dim"
                 )
-            if args.source_embed_path and (
-                args.source_embed_path != args.target_embed_path
+            if args.decoder_embed_path and (
+                args.decoder_embed_path != args.encoder_embed_path
             ):
                 raise ValueError(
-                    "--share-all-embeddings not compatible with --target-embed-path"
+                    "--share-all-embeddings not compatible with --decoder-embed-path"
                 )
             source_encoder_embed_tokens, source_latent_idx = build_embedding(
-                src_dict, args.source_embed_dim, args.source_embed_path
+                src_dict, args.encoder_embed_dim, args.encoder_embed_path
             )
             target_encoder_embed_tokens = source_encoder_embed_tokens
             target_latent_idx = source_latent_idx
@@ -223,13 +223,13 @@ class TransformerAutoEncodeModel(BaseFairseqModel):
             args.share_decoder_input_output_embed = True
         else:
             source_encoder_embed_tokens, source_latent_idx = build_embedding(
-                src_dict, args.source_embed_dim, args.source_embed_path
+                src_dict, args.encoder_embed_dim, args.encoder_embed_path
             )
             target_encoder_embed_tokens, target_latent_idx = build_embedding(
-                tgt_dict, args.target_embed_dim, args.target_embed_path
+                tgt_dict, args.decoder_embed_dim, args.decoder_embed_path
             )
             decoder_embed_tokens, _ = build_embedding(
-                tgt_dict, args.target_embed_dim, args.target_embed_path
+                tgt_dict, args.decoder_embed_dim, args.decoder_embed_path
             )
 
         source_encoder = cls.build_encoder(
@@ -243,7 +243,7 @@ class TransformerAutoEncodeModel(BaseFairseqModel):
         decoder = cls.build_decoder(args, tgt_dict, decoder_embed_tokens)
         vq_embed_tokens = VectorQuantizer(
                 args.encoder_vq_n_token,
-                args.source_embed_dim,
+                args.encoder_embed_dim,
                 decay=args.encoder_vq_decay)
         return cls(args, source_encoder, target_encoder, vq_embed_tokens, decoder)
 
@@ -270,65 +270,80 @@ class TransformerAutoEncodeModel(BaseFairseqModel):
             no_encoder_attn=getattr(args, "no_cross_attention", False),
         )
 
+    def compute_rho(self, num_updates):
+        if self.args.encoder_vq_rho_warmup_updates <= 0:
+            return 1.
+        iter_ratio = min(1., num_updates / self.args.encoder_vq_rho_warmup_updates)
+        rho = np.exp(
+                np.log(self.args.encoder_vq_rho_start) * (1. - iter_ratio) +
+                iter_ratio * np.log(1.))
+        return rho
+
     # TorchScript doesn't support optional arguments with variable length (**kwargs).
     # Current workaround is to add union of all arguments in child classes.
     def forward(
         self,
-        encoder,
-        tokens,
-        lengths,
+        src_tokens,
+        src_lengths,
+        tgt_tokens,
+        tgt_lengths,
         prev_output_tokens,
-        rho,
+        num_updates=None,
         cls_input: Optional[Tensor] = None,
         return_all_hiddens: bool = True,
         features_only: bool = False,
         alignment_layer: Optional[int] = None,
         alignment_heads: Optional[int] = None,
     ):
+        if self.training:
+            assert num_updates is not None
         """
         Run the forward pass for an encoder-decoder model.
 
         Copied from the base class, but without ``**kwargs``,
         which are not supported by TorchScript.
         """
-        encoder_out = encoder(
-            tokens,
-            src_lengths=lengths,
+        rho = self.compute_rho(num_updates)
+        src_encoder_out = self.source_encoder(
+            src_tokens=src_tokens,
+            src_lengths=src_lengths,
             cls_input=cls_input,
             return_all_hiddens=return_all_hiddens,
+            vq_embed_tokens=self.vq_embed_tokens,
+            rho=rho,
         )
-        encoder_out = self.vq_embed_tokens(encoder_out, rho=rho)
-        latent_lengths = (
-                torch.ones_like(lengths) * encoder.latent_len)
-        decoder_out = self.decoder(
+        src_latent_lengths = (
+                torch.ones_like(src_lengths) * self.source_encoder.latent_len)
+        src_decoder_out = self.decoder(
             prev_output_tokens,
-            encoder_out=encoder_out,
+            encoder_out=src_encoder_out,
             features_only=features_only,
             alignment_layer=alignment_layer,
             alignment_heads=alignment_heads,
-            src_lengths=latent_lengths,
+            src_lengths=src_latent_lengths,
             return_all_hiddens=return_all_hiddens,
         )
-        return decoder_out
+        tgt_encoder_out = self.target_encoder(
+            src_tokens=tgt_tokens,
+            src_lengths=tgt_lengths,
+            cls_input=cls_input,
+            return_all_hiddens=return_all_hiddens,
+            vq_embed_tokens=self.vq_embed_tokens,
+            rho=rho,
 
-    def forward_decoder(self, prev_output_tokens, **kwargs):
-        return self.decoder(prev_output_tokens, **kwargs)
-
-    def extract_features(self, encoder, tokens, lengths, prev_output_tokens, rho, **kwargs):
-        """
-        Similar to *forward* but only return features.
-
-        Returns:
-            tuple:
-                - the decoder's features of shape `(batch, tgt_len, embed_dim)`
-                - a dictionary with any model-specific outputs
-        """
-        encoder_out = self.encoder(tokens, src_lengths=lengths, **kwargs)
-        encoder_out = self.vq_embed_tokens(encoder_out, rho=rho)
-        features = self.decoder.extract_features(
-            prev_output_tokens, encoder_out=encoder_out, **kwargs
         )
-        return features
+        tgt_latent_lengths = (
+                torch.ones_like(tgt_lengths) * self.target_encoder.latent_len)
+        tgt_decoder_out = self.decoder(
+            prev_output_tokens,
+            encoder_out=tgt_encoder_out,
+            features_only=features_only,
+            alignment_layer=alignment_layer,
+            alignment_heads=alignment_heads,
+            src_lengths=tgt_latent_lengths,
+            return_all_hiddens=return_all_hiddens,
+        )
+        return src_decoder_out, tgt_decoder_out
 
     def output_layer(self, features, **kwargs):
         """Project features to the default output size (typically vocabulary size)."""
@@ -336,11 +351,22 @@ class TransformerAutoEncodeModel(BaseFairseqModel):
 
     def max_positions(self):
         """Maximum length supported by the model."""
-        return (self.encoder.max_positions(), self.decoder.max_positions())
+        return (self.source_encoder.max_positions(), self.decoder.max_positions())
 
     def max_decoder_positions(self):
         """Maximum length supported by the decoder."""
         return self.decoder.max_positions()
+
+
+FixedEncoderOut = NamedTuple(
+    "FixedEncoderOut",
+    [
+        ("encoder_out", Tensor),  # T x B x C
+        ("encoder_padding_mask", Tensor),  # B x T
+        ("encoder_embedding", Tensor),  # B x T x C
+        ("encoder_states", Optional[List[Tensor]]),  # List[T x B x C]
+    ],
+)
 
 
 class TransformerFixedSizeEncoder(TransformerEncoder):
@@ -353,6 +379,8 @@ class TransformerFixedSizeEncoder(TransformerEncoder):
         self,
         src_tokens,
         src_lengths,
+        vq_embed_tokens,
+        rho,
         cls_input: Optional[Tensor] = None,
         return_all_hiddens: bool = False,
     ):
@@ -379,25 +407,30 @@ class TransformerFixedSizeEncoder(TransformerEncoder):
                     state[:self.latent_len, :, :]
                     for state in outputs.encoder_states]
 
-        return EncoderOut(
+        encoder_out, mse = vq_embed_tokens(
+                encoder_out, rho=rho, return_mse=True)
+
+
+        return FixedEncoderOut(
             encoder_out=encoder_out,  # L x B x C
             encoder_padding_mask=encoder_padding_mask,  # B x L
             encoder_embedding=encoder_embedding,  # B x L x C
             encoder_states=encoder_states,  # List[L x B x C]
+            mse=mse
         )
 
 
-@register_model_architecture("transformer_ae", "transformer")
+@register_model_architecture("transformer_ae", "transformer_ae")
 def base_architecture(args):
-    args.source_embed_path = getattr(args, "source_embed_path", None)
-    args.source_embed_dim = getattr(args, "source_embed_dim", 512)
-    args.target_embed_path = getattr(args, "target_embed_path", None)
-    args.target_embed_dim = getattr(args, "target_embed_dim", args.source_embed_dim)
+    args.encoder_embed_path = getattr(args, "encoder_embed_path", None)
+    args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 512)
     args.encoder_ffn_embed_dim = getattr(args, "encoder_ffn_embed_dim", 2048)
     args.encoder_layers = getattr(args, "encoder_layers", 6)
     args.encoder_attention_heads = getattr(args, "encoder_attention_heads", 8)
     args.encoder_normalize_before = getattr(args, "encoder_normalize_before", False)
     args.encoder_learned_pos = getattr(args, "encoder_learned_pos", False)
+    args.decoder_embed_path = getattr(args, "decoder_embed_path", None)
+    args.decoder_embed_dim = getattr(args, "decoder_embed_dim", args.encoder_embed_dim)
     args.decoder_ffn_embed_dim = getattr(
         args, "decoder_ffn_embed_dim", args.encoder_ffn_embed_dim
     )
@@ -439,52 +472,52 @@ def base_architecture(args):
     args.encoder_vq_length = getattr(args, "encoder_vq_length", 5)
 
 
-@register_model_architecture("transformer_ae", "transformer_iwslt_de_en")
+@register_model_architecture("transformer_ae", "transformer_ae_iwslt_de_en")
 def transformer_iwslt_de_en(args):
-    args.source_embed_dim = getattr(args, "source_embed_dim", 512)
+    args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 512)
     args.encoder_ffn_embed_dim = getattr(args, "encoder_ffn_embed_dim", 1024)
     args.encoder_attention_heads = getattr(args, "encoder_attention_heads", 4)
     args.encoder_layers = getattr(args, "encoder_layers", 6)
-    args.target_embed_dim = getattr(args, "target_embed_dim", 512)
+    args.decoder_embed_dim = getattr(args, "decoder_embed_dim", 512)
     args.decoder_ffn_embed_dim = getattr(args, "decoder_ffn_embed_dim", 1024)
     args.decoder_attention_heads = getattr(args, "decoder_attention_heads", 4)
     args.decoder_layers = getattr(args, "decoder_layers", 6)
     base_architecture(args)
 
 
-@register_model_architecture("transformer_ae", "transformer_wmt_en_de")
+@register_model_architecture("transformer_ae", "transformer_ae_wmt_en_de")
 def transformer_wmt_en_de(args):
     base_architecture(args)
 
 
 # parameters used in the "Attention Is All You Need" paper (Vaswani et al., 2017)
-@register_model_architecture("transformer_ae", "transformer_vaswani_wmt_en_de_big")
+@register_model_architecture("transformer_ae", "transformer_ae_vaswani_wmt_en_de_big")
 def transformer_vaswani_wmt_en_de_big(args):
-    args.source_embed_dim = getattr(args, "source_embed_dim", 1024)
-    args.target_embed_dim = getattr(args, "target_embed_dim", 1024)
+    args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 1024)
     args.encoder_ffn_embed_dim = getattr(args, "encoder_ffn_embed_dim", 4096)
     args.encoder_attention_heads = getattr(args, "encoder_attention_heads", 16)
     args.encoder_normalize_before = getattr(args, "encoder_normalize_before", False)
+    args.decoder_embed_dim = getattr(args, "decoder_embed_dim", 1024)
     args.decoder_ffn_embed_dim = getattr(args, "decoder_ffn_embed_dim", 4096)
     args.decoder_attention_heads = getattr(args, "decoder_attention_heads", 16)
     args.dropout = getattr(args, "dropout", 0.3)
     base_architecture(args)
 
 
-@register_model_architecture("transformer_ae", "transformer_vaswani_wmt_en_fr_big")
+@register_model_architecture("transformer_ae", "transformer_ae_vaswani_wmt_en_fr_big")
 def transformer_vaswani_wmt_en_fr_big(args):
     args.dropout = getattr(args, "dropout", 0.1)
     transformer_vaswani_wmt_en_de_big(args)
 
 
-@register_model_architecture("transformer_ae", "transformer_wmt_en_de_big")
+@register_model_architecture("transformer_ae", "transformer_ae_wmt_en_de_big")
 def transformer_wmt_en_de_big(args):
     args.attention_dropout = getattr(args, "attention_dropout", 0.1)
     transformer_vaswani_wmt_en_de_big(args)
 
 
 # default parameters used in tensor2tensor implementation
-@register_model_architecture("transformer_ae", "transformer_wmt_en_de_big_t2t")
+@register_model_architecture("transformer_ae", "transformer_ae_wmt_en_de_big_t2t")
 def transformer_wmt_en_de_big_t2t(args):
     args.encoder_normalize_before = getattr(args, "encoder_normalize_before", True)
     args.decoder_normalize_before = getattr(args, "decoder_normalize_before", True)
@@ -493,7 +526,7 @@ def transformer_wmt_en_de_big_t2t(args):
     transformer_vaswani_wmt_en_de_big(args)
 
 
-@register_model_architecture("transformer_align", "transformer_align")
+@register_model_architecture("transformer_align", "transformer_ae_align")
 def transformer_align(args):
     args.alignment_heads = getattr(args, "alignment_heads", 1)
     args.alignment_layer = getattr(args, "alignment_layer", 4)
@@ -501,7 +534,7 @@ def transformer_align(args):
     base_architecture(args)
 
 
-@register_model_architecture("transformer_align", "transformer_wmt_en_de_big_align")
+@register_model_architecture("transformer_align", "transformer_ae_wmt_en_de_big_align")
 def transformer_wmt_en_de_big_align(args):
     args.alignment_heads = getattr(args, "alignment_heads", 1)
     args.alignment_layer = getattr(args, "alignment_layer", 4)

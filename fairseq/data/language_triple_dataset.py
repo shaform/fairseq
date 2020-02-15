@@ -65,7 +65,7 @@ def collate(
             'src_tokens': src_tokens,
             'src_lengths': src_lengths,
             'tgt_tokens': tgt_tokens,
-            'tgt_lenghts': tgt_lengths
+            'tgt_lengths': tgt_lengths
         },
         'target': target,
     }

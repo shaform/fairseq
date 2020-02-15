@@ -29,6 +29,7 @@ from .transformer_sentence_encoder import TransformerSentenceEncoder
 from .unfold import unfold1d
 from .transformer_layer import TransformerDecoderLayer, TransformerEncoderLayer
 from .vggblock import VGGBlock
+from .discrete import VectorQuantizer
 
 __all__ = [
     'AdaptiveInput',
@@ -59,6 +60,7 @@ __all__ = [
     'TransformerSentenceEncoder',
     'TransformerDecoderLayer',
     'TransformerEncoderLayer',
+    'VectorQuantizer',
     'VGGBlock',
     'unfold1d',
 ]
