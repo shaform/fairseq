@@ -10,7 +10,7 @@ from . import register_task
 
 
 @register_task("translation_autoencode")
-class TranslationAutoEncode(TranslationTask):
+class TranslationAutoEncodeTask(TranslationTask):
     """
     TranslationAutoEncode
     """
@@ -24,14 +24,4 @@ class TranslationAutoEncode(TranslationTask):
         """
         left_pad_source = options.eval_bool(args.left_pad_source)
         assert not left_pad_source, 'must pad source on the right!'
-        return super(TranslationTask, cls).setup_task(args, **kwargs)
-
-    @staticmethod
-    def add_args(parser):
-        """Add task-specific arguments to the parser."""
-
-        # fmt: off
-        parser.add_argument('--autoencode-length', default=5, type=int,
-                            help='length of encoded vectors')
-        # fmt: on
-        TranslationTask.add_args(parser)
+        return super(TranslationAutoEncodeTask, cls).setup_task(args, **kwargs)
