@@ -343,7 +343,8 @@ class TransformerAutoEncodeModel(BaseFairseqModel):
             src_lengths=tgt_latent_lengths,
             return_all_hiddens=return_all_hiddens,
         )
-        return src_decoder_out, tgt_decoder_out
+        mse = (src_encoder_out.mse + tgt_encoder_out.mse) * self.args.encoder_vq_beta
+        return src_decoder_out, tgt_decoder_out, mse
 
     def output_layer(self, features, **kwargs):
         """Project features to the default output size (typically vocabulary size)."""
@@ -365,6 +366,7 @@ FixedEncoderOut = NamedTuple(
         ("encoder_padding_mask", Tensor),  # B x T
         ("encoder_embedding", Tensor),  # B x T x C
         ("encoder_states", Optional[List[Tensor]]),  # List[T x B x C]
+        ("mse", Tensor),
     ],
 )
 
@@ -416,7 +418,7 @@ class TransformerFixedSizeEncoder(TransformerEncoder):
             encoder_padding_mask=encoder_padding_mask,  # B x L
             encoder_embedding=encoder_embedding,  # B x L x C
             encoder_states=encoder_states,  # List[L x B x C]
-            mse=mse
+            mse=mse.sum(),
         )
 
 
