@@ -271,7 +271,7 @@ class TransformerAutoEncodeModel(BaseFairseqModel):
         )
 
     def compute_rho(self, num_updates):
-        if self.args.encoder_vq_rho_warmup_updates <= 0:
+        if self.args.encoder_vq_rho_warmup_updates <= 0 or num_updates is None:
             return 1.
         iter_ratio = min(1., num_updates / self.args.encoder_vq_rho_warmup_updates)
         rho = np.exp(
