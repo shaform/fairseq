@@ -14,4 +14,5 @@ CUDA_VISIBLE_DEVICES=7 fairseq-train \
     --encoder-vq-beta 0.25 \
     --encoder-vq-rho-start 0.1 \
     --encoder-vq-rho-warmup-updates 139800 \
+    --best-checkpoint-metric loss_tgt \
     --save-dir models/vq-ae
